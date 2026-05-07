@@ -8,437 +8,398 @@
 #include <Wire.h>
 #include "MAX30100_PulseOximeter.h"
 
-#define BOOT_BUTTON_PIN 0 
+// ============================================================
+// FREERTOS — 2 QUEUE GIAO TIẾP GIỮA 2 CORE
+// ============================================================
+struct SensorData { float bpm; int spo2; };
+typedef enum : uint8_t { CMD_SLEEP=0, CMD_WAKEUP=1, CMD_RESTART=2 } DeviceCmd;
 
-// ==========================================
-// 🌟 CẤU HÌNH HIVEMQ CLOUD BẢO MẬT
-// ==========================================
-const char* mqtt_server = "a610b199cda842b3a6207037ad778131.s1.eu.hivemq.cloud"; 
-const int mqtt_port = 8883;
-const char* mqtt_user = "admin";
-const char* mqtt_pass = "01233256549Na";
-const char* mqtt_topic = "HealthData_Upload_2026"; 
-const char* mqtt_cmd_topic = "HealthData_Command_2026"; 
+static QueueHandle_t sensorQueue      = nullptr;
+static QueueHandle_t cmdQueue         = nullptr;
+static TaskHandle_t  sensorTaskHandle = nullptr;
 
-WebServer localServer(80);
-Preferences preferences;
-PulseOximeter pox;
+// ============================================================
+// CẤU HÌNH HIVEMQ
+// ============================================================
+#define BOOT_BUTTON_PIN 0
 
-WiFiClientSecure espClient; 
-PubSubClient mqttClient(espClient);
+const char* mqtt_server    = "a610b199cda842b3a6207037ad778131.s1.eu.hivemq.cloud";
+const int   mqtt_port      = 8883;
+const char* mqtt_user      = "admin";
+const char* mqtt_pass      = "01233256549Na";
+const char* mqtt_topic     = "HealthData_Upload_2026";
+const char* mqtt_cmd_topic = "HealthData_Command_2026";
+const char* mqtt_ack_topic = "HealthData_Ack_2026";
 
-String ssid = "";
-String password = "";
-String userId = "";
+WebServer        localServer(80);
+Preferences      preferences;
+PulseOximeter    pox;
+WiFiClientSecure espClient;
+PubSubClient     mqttClient(espClient);
 
-uint32_t tsLastReport = 0;
-bool isSetupMode = false;
-bool isDeviceActive = true;  // 💤 Chế độ ngủ đông
-uint32_t buttonPressTime = 0;
-bool isButtonPressed = false;
+String ssid = "", password = "", userId = "";
+bool   isSetupMode = false;
 
-float sharedBpm = 0;
-int sharedSpo2 = 0;
-
-// ==========================================
-// ✅ PRE-FILTER: MOVING AVERAGE (LỌC TRƯỚC KALMAN)
-// ==========================================
+// ============================================================
+// BỘ LỌC — CHỈ DÙNG TRONG SensorTask (Core 1)
+// ============================================================
 struct MovingAverage {
     static const int SIZE = 5;
-    float buffer[SIZE] = {0};
-    int index = 0;
-    
-    float apply(float value) {
-        buffer[index] = value;
-        index = (index + 1) % SIZE;
-        
-        float sum = 0;
-        for (int i = 0; i < SIZE; i++) {
-            sum += buffer[i];
-        }
-        return sum / SIZE;
+    float buf[SIZE] = {};
+    int   idx = 0;
+    float apply(float v) {
+        buf[idx] = v; idx = (idx + 1) % SIZE;
+        float s = 0; for (int i = 0; i < SIZE; i++) s += buf[i];
+        return s / SIZE;
     }
-    
-    void reset() {
-        index = 0;
-        for (int i = 0; i < SIZE; i++) {
-            buffer[i] = 0;
-        }
-    }
+    void reset() { idx = 0; memset(buf, 0, sizeof(buf)); }
 };
 
-MovingAverage mavgBpm;
-MovingAverage mavgSpo2;
-
-// ==========================================
-// ✅ STRUCT KALMAN FILTER (CẢI THIỆN)
-// ==========================================
-struct KalmanFilterBPM {
-    float q = 0.003;      // ✅ Giảm từ 0.01 (tin process model hơn)
-    float r = 0.8;        // ✅ Tăng từ 0.1 (tin sensor ít hơn)
-    float x = 0.0;        // State
-    float p = 1.0;        // Error
-    
-    void setParams(float process, float measurement) {
-        q = constrain(process, 0.0001, 0.05);
-        r = constrain(measurement, 0.1, 3.0);
+struct KalmanBPM {
+    float q=0.01, r=0.5, x=0, p=1;
+    float apply(float m) {
+        if (isnan(m) || m < 40 || m > 200) return x;
+        if (x == 0) { x = m; return x; }
+        p += q; float k = p/(p+r); x += k*(m-x); p = (1-k)*p;
+        return constrain(x, 40.f, 200.f);
     }
-    
-    float apply(float measurement) {
-        // ✅ Validation input
-        if (isnan(measurement) || measurement < 40 || measurement > 200) {
-            return x;
-        }
-        
-        // ✅ Initialize on first valid reading
-        if (x == 0.0) {
-            x = measurement;
-            return x;
-        }
-        
-        // Kalman update
-        p = p + q;
-        float k = p / (p + r);
-        x = x + k * (measurement - x);
-        p = (1 - k) * p;
-        
-        return constrain(x, 40.0, 200.0);
-    }
-    
-    void reset() {
-        x = 0.0;
-        p = 1.0;
-    }
+    void reset() { x=0; p=1; }
 };
 
-struct KalmanFilterSpO2 {
-    float q = 0.001;      // ✅ Giảm từ 0.005
-    float r = 1.0;        // ✅ Tăng từ 0.15 (DỰA MẠN hơn)
-    float x = 95.0;
-    float p = 1.0;
-    
-    void setParams(float process, float measurement) {
-        q = constrain(process, 0.0001, 0.01);
-        r = constrain(measurement, 0.1, 2.0);
+struct KalmanSpO2 {
+    float q=0.005, r=0.5, x=95, p=1;
+    float apply(float m) {
+        if (isnan(m) || m < 70 || m > 100) return x;
+        p += q; float k = p/(p+r); x += k*(m-x); p = (1-k)*p;
+        return constrain(x, 70.f, 100.f);
     }
-    
-    float apply(float measurement) {
-        // ✅ Validation input
-        if (isnan(measurement) || measurement < 70 || measurement > 100) {
-            return x;
-        }
-        
-        // Kalman update
-        p = p + q;
-        float k = p / (p + r);
-        x = x + k * (measurement - x);
-        p = (1 - k) * p;
-        
-        return constrain(x, 70.0, 100.0);
-    }
-    
-    void reset() {
-        x = 95.0;
-        p = 1.0;
-    }
+    void reset() { x=95; p=1; }
 };
 
-KalmanFilterBPM kalmanBPM;
-KalmanFilterSpO2 kalmanSPO2;
-
-// ==========================================
-// HÀM NHẬN LỆNH TỪ XA
-// ==========================================
+// ============================================================
+// MQTT CALLBACK — Core 0, KHÔNG đụng I2C
+// ============================================================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-    String message = "";
-    for (int i = 0; i < length; i++) {
-        message += (char)payload[i];
-    }
-    Serial.print("📥 [Lệnh từ xa] Nhận được: ");
-    Serial.println(message);
+    String msg = "";
+    for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+    Serial.println("[Core0] 📥 CMD: " + msg);
 
-    if (message == "RESTART") {
-        Serial.println("🔄 HỆ THỐNG ĐANG KHỞI ĐỘNG LẠI THEO LỆNH TỪ XA...");
-        delay(1000);
-        ESP.restart(); 
-    } 
-    else if (message == "SLEEP") {
-        isDeviceActive = false;
-        pox.shutdown(); // Tắt đèn LED của cảm biến MAX30100 cho đỡ tốn điện
-        Serial.println("💤 THIẾT BỊ ĐÃ VÀO CHẾ ĐỘ NGỦ ĐÔNG...");
-    } 
-    else if (message == "WAKEUP") {
-        isDeviceActive = true;
-        pox.resume(); // Bật lại đèn LED cảm biến
-        Serial.println("☀️ THIẾT BỊ ĐÃ THỨC DẬY, SẴN SÀNG ĐO...");
-    }
+    DynamicJsonDocument doc(256);
+    if (deserializeJson(doc, msg)) return;
+
+    String command   = doc["command"].as<String>();
+    String commandId = doc["commandId"].as<String>();
+    String reqUser   = doc["userId"].as<String>();
+    if (reqUser != userId) return;
+
+    // Gửi ACK ngay
+    StaticJsonDocument<200> ack;
+    ack["commandId"] = commandId;
+    ack["userId"]    = userId;
+    ack["status"]    = "Dang xu ly...";
+    char ackBuf[256];
+    serializeJson(ack, ackBuf);
+    mqttClient.publish(mqtt_ack_topic, ackBuf);
+
+    // Đẩy lệnh vào Queue → Core 1 tự xử lý I2C
+    DeviceCmd cmd;
+    if      (command == "SLEEP")   { cmd = CMD_SLEEP;   xQueueSend(cmdQueue, &cmd, 0); }
+    else if (command == "WAKEUP")  { cmd = CMD_WAKEUP;  xQueueSend(cmdQueue, &cmd, 0); }
+    else if (command == "RESTART") { cmd = CMD_RESTART; xQueueSend(cmdQueue, &cmd, 0); }
 }
 
-// ==========================================
-// HÀM KẾT NỐI LẠI MQTT
-// ==========================================
 void reconnectMQTT() {
-    while (!mqttClient.connected() && WiFi.status() == WL_CONNECTED) {
-        Serial.print("🔐 Đang bắt tay bảo mật SSL...");
-        String clientId = "ESP32Client-HealthIoT-";
-        clientId += String(random(0xffff), HEX);
-        
-        if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-            Serial.println("✅ Đã kết nối HiveMQ!");
+    int retry = 0;
+    while (!mqttClient.connected() && WiFi.status() == WL_CONNECTED && retry < 5) {
+        String id = "ESP32-Health-" + String(random(0xffff), HEX);
+        if (mqttClient.connect(id.c_str(), mqtt_user, mqtt_pass)) {
             mqttClient.subscribe(mqtt_cmd_topic);
+            Serial.println("[Core0] ✅ MQTT OK");
         } else {
-            Serial.print("❌ Lỗi (Mã: ");
-            Serial.print(mqttClient.state());
-            Serial.println("), thử lại sau 3s...");
-            delay(3000);
+            Serial.printf("[Core0] ❌ MQTT err=%d\n", mqttClient.state());
+            vTaskDelay(3000 / portTICK_PERIOD_MS);
+            retry++;
         }
     }
 }
 
 void handleSetup() {
-    if (localServer.hasArg("plain")) {
-        String body = localServer.arg("plain");
-        DynamicJsonDocument doc(512);
-        deserializeJson(doc, body);
-
-        preferences.begin("iot_app", false);
-        preferences.putString("ssid", doc["ssid"].as<String>());
-        preferences.putString("password", doc["password"].as<String>());
-        preferences.putString("userId", doc["userId"].as<String>());
-        preferences.end();
-
-        localServer.send(200, "application/json", "{\"message\":\"Cài đặt thành công!\"}");
-        delay(2000);
-        ESP.restart(); 
-    }
+    if (!localServer.hasArg("plain")) return;
+    DynamicJsonDocument doc(512);
+    deserializeJson(doc, localServer.arg("plain"));
+    preferences.begin("iot_app", false);
+    preferences.putString("ssid",     doc["ssid"].as<String>());
+    preferences.putString("password", doc["password"].as<String>());
+    preferences.putString("userId",   doc["userId"].as<String>());
+    preferences.end();
+    localServer.send(200, "application/json", "{\"message\":\"OK\"}");
+    delay(1500);
+    ESP.restart();
 }
 
-void onBeatDetected() {}
+// ============================================================
+// CORE 0 — NETWORK TASK
+// ============================================================
+void NetworkTask(void* pvParameters) {
+    if (!isSetupMode) {
+        WiFi.begin(ssid.c_str(), password.c_str());
+        Serial.print("[Core0] Kết nối WiFi");
+        int att = 0;
+        while (WiFi.status() != WL_CONNECTED && att < 20) {
+            vTaskDelay(500 / portTICK_PERIOD_MS);
+            Serial.print("."); att++;
+        }
+        if (WiFi.status() == WL_CONNECTED)
+            Serial.println("\n[Core0] ✅ WiFi: " + WiFi.localIP().toString());
+        else
+            Serial.println("\n[Core0] ⚠️ WiFi thất bại, sẽ retry");
+    }
 
-// ==============================================================================
-// TASK MẠNG CHẠY ĐỘC LẬP TRÊN CORE 0
-// ==============================================================================
-void NetworkTask(void *pvParameters) {
-    for (;;) { 
+    for (;;) {
         if (isSetupMode) {
-            localServer.handleClient(); 
-        } else {
-            if (WiFi.status() == WL_CONNECTED) {
-                if (!mqttClient.connected()) {
-                    reconnectMQTT();
-                }
-                mqttClient.loop(); 
+            localServer.handleClient();
+            vTaskDelay(10 / portTICK_PERIOD_MS);
+            continue;
+        }
 
-                if (millis() - tsLastReport > 1000) {
-                    Serial.print("⏳ BPM: ");
-                    Serial.print((int)sharedBpm);
-                    Serial.print(" bpm | SpO2: ");
-                    Serial.print(sharedSpo2);
-                    Serial.println(" %");
+        if (WiFi.status() != WL_CONNECTED) {
+            WiFi.reconnect();
+            vTaskDelay(2000 / portTICK_PERIOD_MS);
+            continue;
+        }
 
-                    if (mqttClient.connected()) {
-                        // ✅ CHỈ GỬI NẾU DỮ LIỆU HỢP LỆ
-                        if (sharedBpm >= 40 && sharedBpm <= 200 && sharedSpo2 >= 70 && sharedSpo2 <= 100) {
-                            StaticJsonDocument<200> doc;
-                            doc["userId"] = userId;
-                            doc["bpm"] = round(sharedBpm); 
-                            doc["spo2"] = sharedSpo2;
-                            doc["isDrowsy"] = false; 
+        if (!mqttClient.connected()) reconnectMQTT();
+        mqttClient.loop();
 
-                            char jsonBuffer[512];
-                            serializeJson(doc, jsonBuffer);
-
-                            if (mqttClient.publish(mqtt_topic, jsonBuffer)) {
-                                Serial.println("   ☁️ Đã gửi lên Server!");
-                            }
-                        }
-                    }
-                    tsLastReport = millis();
-                }
-            } else {
-                WiFi.reconnect();
-                vTaskDelay(2000 / portTICK_PERIOD_MS); 
+        // Chỉ gửi khi Core 1 đẩy data hợp lệ vào Queue
+        SensorData data;
+        if (xQueueReceive(sensorQueue, &data, 0) == pdTRUE) {
+            Serial.printf("[Core0] 📦 BPM=%.0f | SpO2=%d\n", data.bpm, data.spo2);
+            if (mqttClient.connected()) {
+                StaticJsonDocument<200> doc;
+                doc["userId"]   = userId;
+                doc["bpm"]      = round(data.bpm);
+                doc["spo2"]     = data.spo2;
+                doc["isDrowsy"] = false;
+                char buf[256];
+                serializeJson(doc, buf);
+                if (mqttClient.publish(mqtt_topic, buf))
+                    Serial.println("[Core0] ☁️ Đã gửi lên server!");
             }
         }
-        vTaskDelay(10 / portTICK_PERIOD_MS); 
+
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
 
-// ==========================================
-// HÀM KHỞI ĐỘNG (SETUP)
-// ==========================================
+// ============================================================
+// CORE 1 — SENSOR TASK
+// ============================================================
+void SensorTask(void* pvParameters) {
+    if (isSetupMode) {
+        Serial.println("[Core1] Setup Mode — SensorTask suspended");
+        vTaskSuspend(nullptr);
+        return;
+    }
+
+    // Khởi tạo I2C trong task — ràng buộc Wire với Core 1
+    Wire.begin(21, 22);
+    Wire.setClock(400000);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+
+    Wire.beginTransmission(0x57);
+    if (Wire.endTransmission() != 0) {
+        Serial.println("[Core1] ❌ MAX30100 không phản hồi. Dừng task.");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    // Gọi begin() đúng 1 lần — gọi nhiều lần reset DC filter nội bộ
+    if (!pox.begin()) {
+        Serial.println("[Core1] ❌ pox.begin() thất bại. Dừng task.");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    // 27.1mA thay vì 50mA — tránh bão hòa photodiode
+    pox.setIRLedCurrent(MAX30100_LED_CURR_27_1MA);
+    pox.setOnBeatDetectedCallback([](){});
+    Serial.println("[Core1] ✅ MAX30100 khởi tạo xong");
+
+    // Warm-up bắt buộc 5 giây — DC filter hội tụ
+    Serial.println("[Core1] ⏳ Warm-up 5 giây...");
+    uint32_t warmupStart = millis();
+    while (millis() - warmupStart < 5000) {
+        pox.update();
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+    Serial.println("[Core1] ✅ Warm-up xong");
+
+    MovingAverage mavgBpm, mavgSpo2;
+    KalmanBPM     kalBpm;
+    KalmanSpO2    kalSpo2;
+
+    uint32_t fingerStartTime   = 0;
+    uint32_t fingerMissingTime = 0;
+    bool     isFingerStable    = false;
+    bool     isSleeping        = false;
+    uint32_t lastQueueSend     = 0;
+    uint32_t rawDebugTimer     = 0;
+    uint32_t filtDebugTimer    = 0;
+    uint32_t btnPressTime      = 0;
+    bool     btnPressed        = false;
+
+    for (;;) {
+        // Nút BOOT
+        if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+            if (!btnPressed) { btnPressed = true; btnPressTime = millis(); }
+            else if (millis() - btnPressTime > 3000) {
+                Serial.println("[Core1] ⚠️ Xóa cấu hình!");
+                preferences.begin("iot_app", false);
+                preferences.clear();
+                preferences.end();
+                vTaskDelay(500 / portTICK_PERIOD_MS);
+                ESP.restart();
+            }
+        } else { btnPressed = false; }
+
+        // Nhận lệnh từ Core 0
+        DeviceCmd cmd;
+        if (xQueueReceive(cmdQueue, &cmd, 0) == pdTRUE) {
+            if (cmd == CMD_SLEEP && !isSleeping) {
+                pox.shutdown();
+                isSleeping = true;
+                isFingerStable = false;
+                fingerStartTime = fingerMissingTime = 0;
+                mavgBpm.reset(); mavgSpo2.reset();
+                kalBpm.reset();  kalSpo2.reset();
+                xQueueReset(sensorQueue);
+                Serial.println("[Core1] 💤 Sensor sleep");
+
+            } else if (cmd == CMD_WAKEUP && isSleeping) {
+                pox.resume();
+                // Warm-up lại sau wakeup
+                Serial.println("[Core1] ⏳ Warm-up lại 3 giây...");
+                uint32_t wu = millis();
+                while (millis() - wu < 3000) {
+                    pox.update();
+                    vTaskDelay(1 / portTICK_PERIOD_MS);
+                }
+                isSleeping = false;
+                Serial.println("[Core1] ☀️ Sensor sẵn sàng");
+
+            } else if (cmd == CMD_RESTART) {
+                vTaskDelay(300 / portTICK_PERIOD_MS);
+                ESP.restart();
+            }
+        }
+
+        if (isSleeping) {
+            vTaskDelay(50 / portTICK_PERIOD_MS);
+            continue;
+        }
+
+        // Lấy mẫu
+        pox.update();
+
+        float rawBpm  = pox.getHeartRate();
+        int   rawSpo2 = pox.getSpO2();
+        if (!isfinite(rawBpm))  rawBpm  = 0;
+        if (!isfinite(rawSpo2)) rawSpo2 = 0;
+
+        if (millis() - rawDebugTimer > 2000) {
+            Serial.printf("[Core1] 🔴 RAW  BPM=%.1f | SpO2=%d\n", rawBpm, rawSpo2);
+            rawDebugTimer = millis();
+        }
+
+        // Phát hiện ngón tay
+        if (rawSpo2 > 50) {
+            fingerMissingTime = 0;
+            if (fingerStartTime == 0) {
+                fingerStartTime = millis();
+                Serial.println("[Core1] 👆 Phát hiện ngón tay, chờ 5s ổn định...");
+            }
+            if (millis() - fingerStartTime > 5000 && !isFingerStable) {
+                isFingerStable = true;
+                Serial.println("[Core1] ✅ Tín hiệu ổn định");
+            }
+        } else {
+            if (fingerMissingTime == 0) fingerMissingTime = millis();
+            if (millis() - fingerMissingTime > 2000 && fingerStartTime != 0) {
+                Serial.println("[Core1] 👋 Rút tay — reset");
+                fingerStartTime = 0;
+                isFingerStable  = false;
+                mavgBpm.reset(); mavgSpo2.reset();
+                kalBpm.reset();  kalSpo2.reset();
+                xQueueReset(sensorQueue);
+            }
+        }
+
+        // Lọc và gửi Queue
+        if (isFingerStable && rawBpm > 30 && rawSpo2 > 70) {
+            float fBpm  = constrain(kalBpm.apply(mavgBpm.apply(rawBpm)),          40.f, 200.f);
+            int   fSpo2 = constrain((int)kalSpo2.apply(mavgSpo2.apply(rawSpo2)),  70,   100);
+
+            if (millis() - filtDebugTimer > 2000) {
+                Serial.printf("[Core1] ✅ FILTERED BPM=%.1f | SpO2=%d\n", fBpm, fSpo2);
+                filtDebugTimer = millis();
+            }
+
+            if (millis() - lastQueueSend >= 1000) {
+                SensorData d = { fBpm, fSpo2 };
+                if (xQueueSend(sensorQueue, &d, 0) != pdTRUE)
+                    Serial.println("[Core1] ⚠️ Queue đầy");
+                lastQueueSend = millis();
+            }
+        }
+
+        vTaskDelay(1 / portTICK_PERIOD_MS);
+    }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
 void setup() {
     Serial.begin(115200);
-    delay(1000);
-
-    Wire.begin(21, 22);
+    delay(500);
     pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
-    
-    espClient.setInsecure(); 
-    
+
+    sensorQueue = xQueueCreate(5, sizeof(SensorData));
+    cmdQueue    = xQueueCreate(3, sizeof(DeviceCmd));
+    if (!sensorQueue || !cmdQueue) {
+        Serial.println("❌ FATAL: Không tạo được Queue!");
+        ESP.restart();
+    }
+
+    espClient.setInsecure();
     mqttClient.setServer(mqtt_server, mqtt_port);
     mqttClient.setCallback(mqttCallback);
 
     preferences.begin("iot_app", true);
-    ssid = preferences.getString("ssid", "");
+    ssid     = preferences.getString("ssid",     "");
     password = preferences.getString("password", "");
-    userId = preferences.getString("userId", "");
+    userId   = preferences.getString("userId",   "");
     preferences.end();
 
     if (ssid == "" || userId == "") {
         isSetupMode = true;
-        Serial.println("\n⚠️ Chưa có cấu hình! Bật chế độ Setup");
-        WiFi.softAP("ThietBi_YTe_01"); 
+        WiFi.softAP("ThietBi_YTe_01");
         localServer.on("/setup", HTTP_POST, handleSetup);
         localServer.begin();
+        Serial.println("[Setup] ⚠️ Setup Mode — AP: ThietBi_YTe_01");
     } else {
         isSetupMode = false;
-        Serial.println("\n✅ Kết nối Wi-Fi: " + ssid);
-        WiFi.begin(ssid.c_str(), password.c_str());
-        
-        int attempts = 0;
-        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-            delay(500); Serial.print("."); attempts++;
-        }
-
-        if (WiFi.status() == WL_CONNECTED) {
-            Serial.println("\n✅ Wi-Fi OK!");
-            
-            Wire.beginTransmission(0x57);
-            byte error = Wire.endTransmission();
-            
-            if (error == 0) {
-                if (pox.begin()) {
-                    pox.setIRLedCurrent(MAX30100_LED_CURR_24MA); 
-                    pox.setOnBeatDetectedCallback(onBeatDetected);
-                    Serial.println("✅ MAX30100 OK!");
-                }
-            } else {
-                Serial.println("❌ Không tìm thấy sensor!");
-                while(1);
-            }
-        }
+        Serial.println("[Setup] Normal Mode");
     }
 
-    xTaskCreatePinnedToCore(NetworkTask, "NetworkTask", 10000, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(SensorTask,  "SensorTask",  4096,  NULL, 2, &sensorTaskHandle, 1);
+    xTaskCreatePinnedToCore(NetworkTask, "NetworkTask", 20480, NULL, 1, NULL,               0);
+
+    Serial.println("[Setup] ✅ 2 task đã khởi động");
 }
 
-// ==============================================================================
-// VÒNG LẶP CHÍNH CHẠY TRÊN CORE 1 (Lấy mẫu & Lọc)
-// ==============================================================================
-uint32_t fingerStartTime = 0;
-uint32_t fingerMissingTime = 0;
-bool isFingerStable = false;
-
-// ✅ DEBUG TIMER
-static uint32_t rawDebugTimer = 0;
-static uint32_t filterDebugTimer = 0;
-
+// loop() trả CPU lại hệ thống — không dùng nữa
 void loop() {
-    // 1. Quản lý nút Reset
-    if (digitalRead(BOOT_BUTTON_PIN) == LOW) { 
-        if (!isButtonPressed) {
-            isButtonPressed = true;
-            buttonPressTime = millis(); 
-        } else if (millis() - buttonPressTime > 3000) { 
-            Serial.println("\n⚠️ ĐÃ XÓA TOÀN BỘ CẤU HÌNH!");
-            preferences.begin("iot_app", false);
-            preferences.clear();
-            preferences.end();
-            delay(1000);
-            ESP.restart(); 
-        }
-    } else {
-        isButtonPressed = false; 
-    }
-
-    // 2. Lấy mẫu từ sensor
-    if (!isSetupMode && isDeviceActive) {
-        pox.update(); 
-        
-        float rawBpm = pox.getHeartRate();
-        int rawSpo2 = pox.getSpO2();
-
-        // ✅ VALIDATION: Kiểm tra NaN/Inf
-        if (isnan(rawBpm) || isinf(rawBpm) || isnan(rawSpo2) || isinf(rawSpo2)) {
-            return;
-        }
-
-        // ✅ BOUNDS CHECK: Giới hạn giá trị
-        rawBpm = constrain(rawBpm, 40, 200);
-        rawSpo2 = constrain(rawSpo2, 0, 100);
-
-        // ✅ DEBUG: In giá trị thô (mỗi 2s)
-        if (millis() - rawDebugTimer > 2000) {
-            Serial.printf("🔴 RAW: BPM=%d, SpO2=%d\n",
-                (int)rawBpm, rawSpo2);
-            rawDebugTimer = millis();
-        }
-
-        // ==========================================
-        // 🌟 FINGER DETECTION (Cải thiện ngưỡng)
-        // ==========================================
-        // ✅ ĐỔI: SpO2 > 20 → SpO2 > 70 (ngưỡng hợp lý)
-        if (rawSpo2 > 70) {
-            fingerMissingTime = 0;
-            
-            if (fingerStartTime == 0) {
-                fingerStartTime = millis();
-                Serial.println("👆 Phát hiện ngón tay, chờ 3s...");
-            }
-            
-            if (millis() - fingerStartTime > 3000) {
-                isFingerStable = true;
-            }
-            
-        } else {
-            if (fingerMissingTime == 0) {
-                fingerMissingTime = millis();
-            }
-            
-            if (millis() - fingerMissingTime > 2000) {
-                if (fingerStartTime != 0) {
-                    Serial.println("👋 Rút tay - Reset bộ lọc");
-                }
-                
-                fingerStartTime = 0;
-                isFingerStable = false;
-                sharedBpm = 0;
-                sharedSpo2 = 0;
-                
-                // ✅ RESET ĐÚNG CÁCH (dùng reset function)
-                kalmanBPM.reset();
-                kalmanSPO2.reset();
-                mavgBpm.reset();
-                mavgSpo2.reset();
-            }
-        }
-
-        // ==========================================
-        // 🌟 LỌC DỮ LIỆU (Chỉ khi ổn định)
-        // ==========================================
-        if (isFingerStable) {
-            // ✅ STEP 1: Moving Average (pre-filter)
-            float filteredBpm = mavgBpm.apply(rawBpm);
-            float filteredSpo2 = mavgSpo2.apply((float)rawSpo2);
-            
-            // ✅ STEP 2: Kalman Filter
-            float tempBpm = kalmanBPM.apply(filteredBpm);
-            int tempSpo2 = (int)kalmanSPO2.apply(filteredSpo2);
-            
-            // ✅ STEP 3: Final bounds check
-            tempBpm = constrain(tempBpm, 40, 200);
-            tempSpo2 = constrain(tempSpo2, 70, 100);
-            
-            sharedBpm = tempBpm;
-            sharedSpo2 = tempSpo2;
-            
-            // ✅ DEBUG: In dữ liệu lọc (mỗi 2s)
-            if (millis() - filterDebugTimer > 2000) {
-                Serial.printf("✅ FILTERED: BPM=%.1f | SpO2=%d | MAVGbpm=%.1f, MAVGspo2=%.1f\n",
-                    tempBpm, tempSpo2, filteredBpm, filteredSpo2);
-                filterDebugTimer = millis();
-            }
-        }
-    }
+    vTaskDelete(NULL);
 }
